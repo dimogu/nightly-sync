@@ -3,6 +3,7 @@ package com.fongmi.android.tv;
 import android.os.CancellationSignal;
 import android.text.format.DateUtils;
 import android.text.format.Formatter;
+import android.util.Log;
 import android.view.View;
 import androidx.fragment.app.FragmentActivity;
 import androidx.lifecycle.Lifecycle;
@@ -64,6 +65,7 @@ public class Updater {
      * 供 App 在启动/回到前台时调用：静默自动检查（带节流）。
      */
     public void startAuto(FragmentActivity activity) {
+        Log.d("Updater", "startAuto 触发（force=false），更新开关=" + Setting.getUpdate());
         start(activity, false);
     }
 
@@ -82,7 +84,10 @@ public class Updater {
             return;
         }
         // 非手动触发时，若距上次自动检查不足间隔则跳过
-        if (!force && recentlyChecked()) return;
+        if (!force && recentlyChecked()) {
+            Log.d("Updater", "距上次自动检查不足 " + (AUTO_CHECK_INTERVAL / 3600000) + "h，跳过");
+            return;
+        }
         this.activity = new WeakReference<>(activity);
         if (checking || dialog.get() != null || activity.getSupportFragmentManager().findFragmentByTag(UpdateDialog.TAG) != null) return;
         markChecked();
