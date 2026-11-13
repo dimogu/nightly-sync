@@ -1,0 +1,152 @@
+name: Build & Release (auto-update patch fork)
+
+# 说明（务必先读仓库 README）：
+# 本仓库【不存放官方完整源码】，只存放 3 个自动更新补丁文件 + 本流水线。
+# 流水线在 GitHub 服务器上运行，每次自动：
+#   1) 拉取官方 FongMi/TV 最新源码（fongmi 分支）
+#   2) 套上我们的自动更新补丁（Github.java / Updater.java / App.java）
+#   3) 把 App 的更新源锁定为本仓库自身（无需手动改任何代码）
+#   4) 签名编译 电视版(leanback)+手机版(mobile) 双 ABI
+#   5) 发布到【本仓库自己的 Releases】
+# 因为 App 的更新源指向本仓库，所以每次升级上来的版本依旧自带自动更新，形成闭环。
+# 且官方一出新版，本流水线次日自动同步并发布带自更新的版本。
+
+on:
+  schedule:
+    # 每天 UTC 16:00（北京时间次日 0:00）检测官方是否有新版本
+    - cron: '0 16 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: '强制重新构建并发布（即使版本号未变）'
+        required: false
+        default: 'false'
+
+permissions:
+  contents: write
+
+env:
+  # 构建环境取自官方 gradle/libs.versions.toml（2026-11 快照）
+  ANDROID_COMPILE_SDK: "37"
+  ANDROID_BUILD_TOOLS: "37.0.0"
+  ANDROID_NDK_VERSION: "27.0.12077973"
+  JAVA_VERSION: "21"
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout 本仓库（仅含补丁 + 流水线）
+        uses: actions/checkout@v4
+
+      - name: 克隆官方 FongMi/TV 最新源码（fongmi 分支）
+        run: |
+          git clone --depth 1 --branch fongmi https://github.com/FongMi/TV.git upstream-src
+
+      - name: 套用自动更新补丁（覆盖 3 个文件）
+        run: |
+          cp -v app/src/main/java/com/fongmi/android/tv/utils/Github.java  upstream-src/app/src/main/java/com/fongmi/android/tv/utils/Github.java
+          cp -v app/src/main/java/com/fongmi/android/tv/Updater.java       upstream-src/app/src/main/java/com/fongmi/android/tv/Updater.java
+          cp -v app/src/main/java/com/fongmi/android/tv/App.java           upstream-src/app/src/main/java/com/fongmi/android/tv/App.java
+
+      - name: 把更新源锁定为本仓库（无需手动改 Github.java）
+        run: |
+          sed -i "s#private static final String REPO = \".*\"#private static final String REPO = \"${{ github.repository }}\"#" upstream-src/app/src/main/java/com/fongmi/android/tv/utils/Github.java
+          grep -n "REPO =" upstream-src/app/src/main/java/com/fongmi/android/tv/utils/Github.java
+
+      - name: 设置 JDK ${{ env.JAVA_VERSION }}
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: ${{ env.JAVA_VERSION }}
+
+      - name: 安装 Android SDK / NDK
+        uses: android-actions/setup-android@v3
+
+      - name: 安装 SDK 组件并同意协议
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-${{ env.ANDROID_COMPILE_SDK }}" "build-tools;${{ env.ANDROID_BUILD_TOOLS }}" "ndk;${{ env.ANDROID_NDK_VERSION }}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> "$GITHUB_ENV"
+
+      - name: 从 Secret 还原签名 keystore + local.properties
+        run: |
+          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$GITHUB_WORKSPACE/keystore.jks"
+          {
+            echo "storeFile=$GITHUB_WORKSPACE/keystore.jks"
+            echo "keyAlias=${{ secrets.KEY_ALIAS }}"
+            echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
+            echo "storePassword=${{ secrets.STORE_PASSWORD }}"
+          } > upstream-src/local.properties
+
+      - name: 赋予 gradlew 执行权限
+        working-directory: upstream-src
+        run: chmod +x ./gradlew
+
+      - name: 读取版本号（取自官方 app/build.gradle 的 versionName）
+        id: version
+        working-directory: upstream-src
+        run: |
+          VERSION=$(grep -oP 'versionName "\K[0-9]+\.[0-9]+\.[0-9]+' app/build.gradle | head -1)
+          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "当前版本：v$VERSION"
+
+      - name: 该版本 Release 是否已存在（存在则跳过，避免重复构建）
+        id: tagcheck
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+            echo "Release ${{ steps.version.outputs.tag }} 已存在，跳过构建"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 编译 Release APK（电视版 + 手机版，双 ABI）
+        if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
+        working-directory: upstream-src
+        run: ./gradlew assembleLeanbackRelease assembleMobileRelease --no-daemon
+
+      - name: 重命名为 App 更新器期望的文件名
+        if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
+        run: |
+          mkdir -p artifacts
+          find upstream-src/app -name "*.apk" -path "*/release/*" | while read f; do
+            n=$(basename "$f")
+            echo "发现 APK: $n"
+            case "$n" in
+              *leanback*arm64*)   cp "$f" artifacts/leanback-arm64_v8a.apk ;;
+              *leanback*armeabi*) cp "$f" artifacts/leanback-armeabi_v7a.apk ;;
+              *mobile*arm64*)     cp "$f" artifacts/mobile-arm64_v8a.apk ;;
+              *mobile*armeabi*)   cp "$f" artifacts/mobile-armeabi_v7a.apk ;;
+            esac
+          done
+          ls -lh artifacts
+
+      - name: 生成 Release 说明
+        if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
+        run: |
+          {
+            echo "# 電視版"
+            echo "- 自动同步自 FongMi/TV v${{ steps.version.outputs.name }}，已内置自动更新"
+            echo ""
+            echo "# 手機版"
+            echo "- 自动同步自 FongMi/TV v${{ steps.version.outputs.name }}，已内置自动更新"
+          } > notes.md
+          cat notes.md
+
+      - name: 发布到本仓库的 Release
+        if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          name: ${{ steps.version.outputs.tag }}
+          body_path: notes.md
+          files: artifacts/*.apk
+          draft: false
+          prerelease: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
