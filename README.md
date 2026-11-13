@@ -129,6 +129,13 @@ App 的 `Updater` 按 `flavor-abi.apk` 匹配更新包，`Github.getAsset` 据�
 
 ## 五、构建环境说明（首次可能要微调）
 
+> ⚠️ **前置硬依赖：mpv / ffmpeg 两个预编译 aar**
+> FongMi/TV 编译时必须存在 `app/libs/lib-mpvplayer-release.aar` 与 `app/libs/lib-decoder-ffmpeg-release.aar`，
+> 这是 mpv / FFmpeg 的预编译 native 库。**它们是 FongMi 私有的 mpv library 构建产物，官方从不发布，无任何公开下载源**（已逐一核实：官方 git 仓库、FongMi/Release 各 tag 均不存在）。
+> **你需要自行提供一次**：用 FongMi 的 mpv library 构建方式产出这两个 aar，上传到本仓库 Release（tag 固定为 `mpv-libs`）。
+> 流水线会在编译前自动从 `mpv-libs` 下载它们；缺失则构建会明确报错并给出指引。
+> 一旦提供过一次，之后所有自动同步构建都会复用，无需再管。
+
 流水线构建环境取自官方 `gradle/libs.versions.toml`（2026-11 快照）：
 
 - Gradle 9.7.1（由 wrapper 自动下载）
