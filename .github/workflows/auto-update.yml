@@ -59,22 +59,23 @@ jobs:
           distribution: 'temurin'
           java-version: ${{ env.JAVA_VERSION }}
 
-      # 手动安装 Android SDK（不使用 android-actions/setup-android，因其会在新版 cmdline-tools 上
-      # 尝试安装已废弃的 "tools" 包而失败）。NDK 交给 Gradle 按需自动下载，避免版本猜错。
-      - name: 安装 Android SDK（cmdline-tools + platform + build-tools）
+      # 手动安装 Android SDK 基础（commandline-tools），平台/构建工具/NDK 交给 Gradle/AGP 自动下载。
+      # 注意：不使用 android-actions/setup-android（新版 cmdline-tools 上会卡在已废弃的 "tools" 包）；
+      # 也不在这里用 sdkmanager 显式装包——其 CLI 的仓库元数据解析在本环境会报
+      # "Failed to find package 'platforms;android-37'"，而 AGP 自带的 sdklib 下载通道能正确解析并拉取。
+      - name: 安装 Android SDK（基础 commandline-tools）
         run: |
           SDK=$HOME/android-sdk
           mkdir -p "$SDK/cmdline-tools"
           curl -fsSL -o ct.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
           unzip -q ct.zip -d "$SDK/cmdline-tools"
           mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
+          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
-          yes | sdkmanager --licenses >/dev/null
-          sdkmanager "platform-tools" "platforms;android-${{ env.ANDROID_COMPILE_SDK }}" "build-tools;${{ env.ANDROID_BUILD_TOOLS }}"
-          {
-            echo "ANDROID_HOME=$SDK"
-            echo "ANDROID_SDK_ROOT=$SDK"
-          } >> "$GITHUB_ENV"
+          # 尽力预装平台/构建工具；若因仓库元数据问题失败，后续由 Gradle/AGP 自动下载兜底（不阻断流程）
+          yes | sdkmanager --update >/dev/null 2>&1 || true
+          sdkmanager "platform-tools" "platforms;android-${{ env.ANDROID_COMPILE_SDK }}" "build-tools;${{ env.ANDROID_BUILD_TOOLS }}" >/dev/null 2>&1 || echo "sdkmanager 显式安装未完成，转由 AGP 自动下载"
 
       - name: 从 Secret 还原签名 keystore + local.properties（位于仓库根，官方 build.gradle 会从这里读取）
         run: |
