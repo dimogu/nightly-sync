@@ -1,219 +1,104 @@
-name: Build & Release (auto-update patch fork)
+name: repatch-auto-update
 
-# 说明（务必先读仓库 README）：
-# 本仓库【不存放官方完整源码】，只存放 3 个自动更新补丁文件 + 本流水线。
-# 流水线在 GitHub 服务器上运行，每次自动：
-#   1) 拉取官方 FongMi/TV 最新源码（fongmi 分支）
-#   2) 套上我们的自动更新补丁（Github.java / Updater.java / App.java）
-#   3) 把 App 的更新源锁定为本仓库自身（无需手动改任何代码）
-#   4) 签名编译 电视版(leanback)+手机版(mobile) 双 ABI
-#   5) 发布到【本仓库自己的 Releases】
-# 因为 App 的更新源指向本仓库，所以每次升级上来的版本依旧自带自动更新，形成闭环。
-# 且官方一出新版，本流水线次日自动同步并发布带自更新的版本。
+# 重打包官方已编译 APK，注入自动更新（绕开私有 aar 编译门槛）。
+# 流程：每 6 小时检查 FongMi/Release 是否有新版 →
+#   下载官方 4 个 APK → apktool 反编译 → repatch.py 改更新源+注入自动检查 →
+#   重打包 → 用本仓库签名 keystore 重签名 → 发到本仓库 Release（同名 APK）。
+# App 更新源指向本仓库，升级上来的版本依旧带自更新，形成闭环。
 
 on:
   schedule:
-    # 每天 UTC 16:00（北京时间次日 0:00）检测官方是否有新版本
-    - cron: '0 16 * * *'
+    - cron: '17 */6 * * *'
   workflow_dispatch:
-    inputs:
-      force:
-        description: '强制重新构建并发布（即使版本号未变）'
-        required: false
-        default: 'false'
+  push:
+    branches: [main]
+    paths: ['.github/workflows/auto-update.yml', 'repatch.py']
 
 permissions:
   contents: write
 
 env:
-  # 构建环境取自官方 gradle/libs.versions.toml（2026-11 快照）
-  ANDROID_COMPILE_SDK: "37"
-  ANDROID_BUILD_TOOLS: "37.0.0"
-  JAVA_VERSION: "21"
+  REPO_TO: dimogu/nightly-sync
+  APKTOOL_VER: 2.10.0
+  UBER_VER: 1.3.0
 
 jobs:
-  build:
+  repatch:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout 本仓库（仅含补丁 + 流水线）
+      - name: 检出仓库（取 repatch.py）
         uses: actions/checkout@v4
 
-      - name: 克隆官方 FongMi/TV 最新源码（fongmi 分支）
+      - name: 安装 Java / apktool / uber-apk-signer
         run: |
-          git clone --depth 1 --branch fongmi https://github.com/FongMi/TV.git upstream-src
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openjdk-17-jdk-headless python3 unzip wget
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+          wget -q "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_${APKTOOL_VER}.jar" -O apktool.jar
+          wget -q "https://github.com/patrickfav/uber-apk-signer/releases/download/v${UBER_VER}/uber-apk-signer-${UBER_VER}.jar" -O uber.jar
+          ls -la apktool.jar uber.jar
 
-      - name: 套用自动更新补丁（覆盖 3 个文件）
-        run: |
-          cp -v app/src/main/java/com/fongmi/android/tv/utils/Github.java  upstream-src/app/src/main/java/com/fongmi/android/tv/utils/Github.java
-          cp -v app/src/main/java/com/fongmi/android/tv/Updater.java       upstream-src/app/src/main/java/com/fongmi/android/tv/Updater.java
-          cp -v app/src/main/java/com/fongmi/android/tv/App.java           upstream-src/app/src/main/java/com/fongmi/android/tv/App.java
-
-      - name: 把更新源锁定为本仓库（无需手动改 Github.java）
-        run: |
-          sed -i "s#private static final String REPO = \".*\"#private static final String REPO = \"${{ github.repository }}\"#" upstream-src/app/src/main/java/com/fongmi/android/tv/utils/Github.java
-          grep -n "REPO =" upstream-src/app/src/main/java/com/fongmi/android/tv/utils/Github.java
-
-      - name: 设置 JDK ${{ env.JAVA_VERSION }}
-        uses: actions/setup-java@v4
-        with:
-          distribution: 'temurin'
-          java-version: ${{ env.JAVA_VERSION }}
-
-      # 手动安装 Android SDK 基础（commandline-tools），平台/构建工具/NDK 交给 Gradle/AGP 自动下载。
-      # 注意：不使用 android-actions/setup-android（新版 cmdline-tools 上会卡在已废弃的 "tools" 包）；
-      # 也不在这里用 sdkmanager 显式装包——其 CLI 的仓库元数据解析在本环境会报
-      # "Failed to find package 'platforms;android-37'"，而 AGP 自带的 sdklib 下载通道能正确解析并拉取。
-      - name: 安装 Android SDK（基础 commandline-tools）并接受许可
-        run: |
-          SDK=$HOME/android-sdk
-          mkdir -p "$SDK/cmdline-tools"
-          curl -fsSL -o ct.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
-          unzip -q ct.zip -d "$SDK/cmdline-tools"
-          mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
-          echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
-          echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
-          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
-          # 兜底：先直接写入许可文件（NDK 与 SDK 共用 android-sdk-license），避免 sdkmanager 异常时无许可
-          mkdir -p "$SDK/licenses"
-          printf '24333f8a63b6825ea9c5514f83c2829b004f7c7a\n' > "$SDK/licenses/android-sdk-license"
-          printf '84831b9409646a918e30573bab4c9c91346d8abd\n' > "$SDK/licenses/android-sdk-preview-license"
-          # 再跑 sdkmanager --licenses 写入权威哈希（覆盖上面的兜底值，确保与 NDK 28 匹配）
-          yes | sdkmanager --licenses >/dev/null 2>&1 || true
-          echo "许可状态："; ls -1 "$SDK/licenses" 2>/dev/null || true
-          echo "android-sdk-license 内容：" && cat "$SDK/licenses/android-sdk-license" 2>/dev/null
-
-      - name: 从 Secret 还原签名 keystore + local.properties（官方 build.gradle 从仓库根读取）
+      - name: 取官方最新版本 & 判断是否需构建
+        id: meta
         env:
-          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          OFFICIAL=$(gh api repos/FongMi/Release/releases/latest --jq '.tag_name')
+          echo "official=$OFFICIAL"
+          OURS=$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)
+          echo "ours=$OURS"
+          echo "official=$OFFICIAL" >> "$GITHUB_OUTPUT"
+          if [ "${OURS#v}" = "$OFFICIAL" ]; then
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: 跳过（已是最新）
+        if: steps.meta.outputs.skip == 'true'
+        run: echo "官方版本 ${{ steps.meta.outputs.official }} 已发布，跳过"
+
+      - name: 下载官方 4 个 APK
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          mkdir -p apks
+          for f in leanback-arm64_v8a leanback-armeabi_v7a mobile-arm64_v8a mobile-armeabi_v7a; do
+            curl -sSL -o "apks/$f.apk" "https://github.com/FongMi/Release/releases/download/${{ steps.meta.outputs.official }}/$f.apk"
+            echo "$f.apk -> $(wc -c < apks/$f.apk) bytes"
+          done
+
+      - name: 反编译 + 注入 + 重打包 + 签名
+        if: steps.meta.outputs.skip != 'true'
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
-          KEY_PW: ${{ secrets.KEY_PASSWORD }}
-          STORE_PW: ${{ secrets.STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
         run: |
-          # 用 --ignore-garbage 容忍 secret 中可能混入的空白/控制字符
-          echo "$KEYSTORE_B64" | base64 -d --ignore-garbage > "$GITHUB_WORKSPACE/keystore.jks"
-          {
-            echo "storeFile=$GITHUB_WORKSPACE/keystore.jks"
-            echo "keyAlias=$KEY_ALIAS"
-            echo "keyPassword=$KEY_PW"
-            echo "storePassword=$STORE_PW"
-          } > upstream-src/local.properties
-          ls -la "$GITHUB_WORKSPACE/keystore.jks"
-          # 自检：keystore 必须能被口令打开，否则签名阶段必败
-          if keytool -list -keystore "$GITHUB_WORKSPACE/keystore.jks" -storepass "$STORE_PW" >/dev/null 2>&1; then
-            echo "keystore 校验通过 (alias=$KEY_ALIAS)"
-          else
-            echo "::error::keystore 校验失败，请检查 KEYSTORE_BASE64 / KEY_PASSWORD / STORE_PASSWORD Secret 是否匹配"
-            exit 1
-          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > keystore.jks
+          mkdir -p dec out signed release
+          for f in leanback-arm64_v8a leanback-armeabi_v7a mobile-arm64_v8a mobile-armeabi_v7a; do
+            echo "=== 处理 $f ==="
+            rm -rf "dec/$f"; java -jar apktool.jar d -f -o "dec/$f" "apks/$f.apk" >/dev/null
+            python3 repatch.py "dec/$f" "$REPO_TO"
+            java -jar apktool.jar b -f -o "out/$f-unsigned.apk" "dec/$f" >/dev/null
+            java -jar uber.jar --apks "out/$f-unsigned.apk" \
+              --ks keystore.jks --ks-key-alias "$KEY_ALIAS" \
+              --ks-pass "pass:$STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" \
+              --out signed >/dev/null
+            s=$(ls signed/$f-unsigned*.apk 2>/dev/null | head -1)
+            cp "$s" "release/$f.apk"
+            echo "release/$f.apk <- $s"
+          done
+          ls -la release/
 
-      - name: 赋予 gradlew 执行权限
-        working-directory: upstream-src
-        run: chmod +x ./gradlew
-
-      # 准备 mpv / ffmpeg 预编译 aar（FongMi 私有构建产物，官方从不发布，需自行提供一次）
-      # 这两个 aar 是 FongMi/TV 编译的硬性前置依赖：lib-mpvplayer-release.aar 与 lib-decoder-ffmpeg-release.aar。
-      # 来源：用 FongMi 的 mpv library 构建方式产出，或从你已有的 FongMi/TV 编译环境中取得。
-      # 获取后上传到本仓库的 Release（tag 固定为 mpv-libs），本步骤会自动下载复用；缺失则给出明确指引并终止。
-      - name: 准备 mpv/ffmpeg 预编译 aar（外部依赖，需自行提供一次）
-        working-directory: upstream-src
+      - name: 发布到本仓库 Release
+        if: steps.meta.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          mkdir -p app/libs
-          for aar in lib-mpvplayer-release.aar lib-decoder-ffmpeg-release.aar; do
-            if gh release download mpv-libs -R "${{ github.repository }}" -p "$aar" -D app/libs 2>/dev/null; then
-              echo "已获取 $aar"
-            else
-              echo "::error::缺少 $aar —— FongMi/TV 编译必需的 mpv/ffmpeg 预编译库（FongMi 私有构建产物，官方不发布、无公开下载源）"
-              echo "::error::请在本仓库创建 Release（tag 固定为 mpv-libs），并上传这两个 aar："
-              echo "::error::  1) lib-mpvplayer-release.aar"
-              echo "::error::  2) lib-decoder-ffmpeg-release.aar"
-              echo "::error::来源：用 FongMi 的 mpv library 构建产出，或从你已有的 FongMi/TV 编译环境中取得"
-              exit 1
-            fi
-          done
-          ls -la app/libs
-
-      # 缓存 Gradle 依赖，加速后续构建
-      - name: 缓存 Gradle 依赖
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: gradle-deps-${{ runner.os }}
-
-      - name: 读取版本号（取自官方 app/build.gradle 的 versionName，注意带等号）
-        id: version
-        working-directory: upstream-src
-        run: |
-          # 兼容多种写法：versionName "5.8.8" / versionName = "5.8.8" 等（官方当前用无等号写法）
-          VERSION=$(grep -oE 'versionName[^0-9]*[0-9]+\.[0-9]+\.[0-9]+' app/build.gradle | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
-          if [ -z "$VERSION" ]; then echo "未能提取版本号"; exit 1; fi
-          echo "name=$VERSION" >> "$GITHUB_OUTPUT"
-          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
-          echo "当前版本：v$VERSION"
-
-      - name: 该版本 Release 是否已存在（存在则跳过，避免重复构建）
-        id: tagcheck
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          if gh release view "${{ steps.version.outputs.tag }}" >/dev/null 2>&1; then
-            echo "exists=true" >> "$GITHUB_OUTPUT"
-            echo "Release ${{ steps.version.outputs.tag }} 已存在，跳过构建"
-          else
-            echo "exists=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: 编译 Release APK（电视版 + 手机版，双 ABI）
-        if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
-        working-directory: upstream-src
-        run: ./gradlew assembleLeanbackRelease assembleMobileRelease --no-daemon -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
-
-      - name: 重命名为 App 更新器期望的文件名
-        if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
-        run: |
-          mkdir -p artifacts
-          find upstream-src/app -name "*.apk" -path "*/release/*" | while read f; do
-            n=$(basename "$f")
-            echo "发现 APK: $n"
-            case "$n" in
-              *leanback*arm64*)   cp "$f" artifacts/leanback-arm64_v8a.apk ;;
-              *leanback*armeabi*) cp "$f" artifacts/leanback-armeabi_v7a.apk ;;
-              *mobile*arm64*)     cp "$f" artifacts/mobile-arm64_v8a.apk ;;
-              *mobile*armeabi*)   cp "$f" artifacts/mobile-armeabi_v7a.apk ;;
-              *) echo "  未匹配的 APK 名: $n" ;;
-            esac
-          done
-          echo "=== 产物清单 ==="
-          ls -lh artifacts
-          # 强校验：必须产出 4 个预期文件，否则构建产物命名有变，及时报错
-          for expected in leanback-arm64_v8a.apk leanback-armeabi_v7a.apk mobile-arm64_v8a.apk mobile-armeabi_v7a.apk; do
-            [ -f "artifacts/$expected" ] || { echo "缺少预期产物: $expected"; exit 1; }
-          done
-
-      - name: 生成 Release 说明
-        if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
-        run: |
-          {
-            echo "# 電視版"
-            echo "- 自动同步自 FongMi/TV v${{ steps.version.outputs.name }}，已内置自动更新"
-            echo ""
-            echo "# 手機版"
-            echo "- 自动同步自 FongMi/TV v${{ steps.version.outputs.name }}，已内置自动更新"
-          } > notes.md
-          cat notes.md
-
-      - name: 发布到本仓库的 Release
-        if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
-        uses: softprops/action-gh-release@v2
-        with:
-          tag_name: ${{ steps.version.outputs.tag }}
-          name: ${{ steps.version.outputs.tag }}
-          body_path: notes.md
-          files: artifacts/*.apk
-          draft: false
-          prerelease: false
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG="v${{ steps.meta.outputs.official }}"
+          gh release create "$TAG" \
+            --title "fongmi 自动更新版 $TAG" \
+            --notes "由 dimogu/nightly-sync 自动重打包：更新源指向本仓库 + 启动即静默检查更新。首次安装请先卸载官方原版（签名不同）。仅供个人使用。" \
+            release/*.apk
