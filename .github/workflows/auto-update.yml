@@ -77,15 +77,29 @@ jobs:
           yes | sdkmanager --update >/dev/null 2>&1 || true
           sdkmanager "platform-tools" "platforms;android-${{ env.ANDROID_COMPILE_SDK }}" "build-tools;${{ env.ANDROID_BUILD_TOOLS }}" >/dev/null 2>&1 || echo "sdkmanager 显式安装未完成，转由 AGP 自动下载"
 
-      - name: 从 Secret 还原签名 keystore + local.properties（位于仓库根，官方 build.gradle 会从这里读取）
+      - name: 从 Secret 还原签名 keystore + local.properties（官方 build.gradle 从仓库根读取）
+        env:
+          KEYSTORE_B64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PW: ${{ secrets.KEY_PASSWORD }}
+          STORE_PW: ${{ secrets.STORE_PASSWORD }}
         run: |
-          echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$GITHUB_WORKSPACE/keystore.jks"
+          # 用 --ignore-garbage 容忍 secret 中可能混入的空白/控制字符
+          echo "$KEYSTORE_B64" | base64 -d --ignore-garbage > "$GITHUB_WORKSPACE/keystore.jks"
           {
             echo "storeFile=$GITHUB_WORKSPACE/keystore.jks"
-            echo "keyAlias=${{ secrets.KEY_ALIAS }}"
-            echo "keyPassword=${{ secrets.STORE_PASSWORD }}"
-            echo "storePassword=${{ secrets.STORE_PASSWORD }}"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PW"
+            echo "storePassword=$STORE_PW"
           } > upstream-src/local.properties
+          ls -la "$GITHUB_WORKSPACE/keystore.jks"
+          # 自检：keystore 必须能被口令打开，否则签名阶段必败
+          if keytool -list -keystore "$GITHUB_WORKSPACE/keystore.jks" -storepass "$STORE_PW" >/dev/null 2>&1; then
+            echo "keystore 校验通过 (alias=$KEY_ALIAS)"
+          else
+            echo "::error::keystore 校验失败，请检查 KEYSTORE_BASE64 / KEY_PASSWORD / STORE_PASSWORD Secret 是否匹配"
+            exit 1
+          fi
 
       - name: 赋予 gradlew 执行权限
         working-directory: upstream-src
