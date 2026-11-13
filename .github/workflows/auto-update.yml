@@ -63,7 +63,7 @@ jobs:
       # 注意：不使用 android-actions/setup-android（新版 cmdline-tools 上会卡在已废弃的 "tools" 包）；
       # 也不在这里用 sdkmanager 显式装包——其 CLI 的仓库元数据解析在本环境会报
       # "Failed to find package 'platforms;android-37'"，而 AGP 自带的 sdklib 下载通道能正确解析并拉取。
-      - name: 安装 Android SDK（基础 commandline-tools）
+      - name: 安装 Android SDK（基础 commandline-tools）并接受许可
         run: |
           SDK=$HOME/android-sdk
           mkdir -p "$SDK/cmdline-tools"
@@ -73,9 +73,14 @@ jobs:
           echo "ANDROID_HOME=$SDK" >> "$GITHUB_ENV"
           echo "ANDROID_SDK_ROOT=$SDK" >> "$GITHUB_ENV"
           export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
-          # 尽力预装平台/构建工具；若因仓库元数据问题失败，后续由 Gradle/AGP 自动下载兜底（不阻断流程）
-          yes | sdkmanager --update >/dev/null 2>&1 || true
-          sdkmanager "platform-tools" "platforms;android-${{ env.ANDROID_COMPILE_SDK }}" "build-tools;${{ env.ANDROID_BUILD_TOOLS }}" >/dev/null 2>&1 || echo "sdkmanager 显式安装未完成，转由 AGP 自动下载"
+          # 兜底：先直接写入许可文件（NDK 与 SDK 共用 android-sdk-license），避免 sdkmanager 异常时无许可
+          mkdir -p "$SDK/licenses"
+          printf '24333f8a63b6825ea9c5514f83c2829b004f7c7a\n' > "$SDK/licenses/android-sdk-license"
+          printf '84831b9409646a918e30573bab4c9c91346d8abd\n' > "$SDK/licenses/android-sdk-preview-license"
+          # 再跑 sdkmanager --licenses 写入权威哈希（覆盖上面的兜底值，确保与 NDK 28 匹配）
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          echo "许可状态："; ls -1 "$SDK/licenses" 2>/dev/null || true
+          echo "android-sdk-license 内容：" && cat "$SDK/licenses/android-sdk-license" 2>/dev/null
 
       - name: 从 Secret 还原签名 keystore + local.properties（官方 build.gradle 从仓库根读取）
         env:
