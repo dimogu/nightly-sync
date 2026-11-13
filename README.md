@@ -133,11 +133,12 @@ App 的 `Updater` 按 `flavor-abi.apk` 匹配更新包，`Github.getAsset` 据�
 
 - Gradle 9.7.1（由 wrapper 自动下载）
 - AGP 9.5.1，Java 21，compileSdk/targetSdk 37，minSdk 24，buildTools 37.0.0
-- 额外安装了 **NDK 27.0.12077973**（项目含 Chaquopy/Node/Thunder 原生依赖，保险起见装上）
+- Android SDK 通过官方 commandline-tools **手动安装**（未使用 `android-actions/setup-android`，因其在新版 cmdline-tools 上会因已废弃的 `tools` 包报错）
+- **NDK 由 Gradle 按需自动下载**（官方未在 version catalog 固定 NDK 版本，交给 Gradle 拉取最稳妥，避免版本猜错）
 
-**首次运行若构建失败**，多半是 NDK/SDK 版本或 Chaquopy 下载问题，看 Actions 日志：
-- 报 `NDK not found` / `ndk version` 相关 → 调整 `env.ANDROID_NDK_VERSION`；
+**首次运行若构建失败**，多半是 SDK/NDK 版本或 Chaquopy 下载问题，看 Actions 日志：
 - 报 SDK platform 缺失 → 调整 `env.ANDROID_COMPILE_SDK`；
+- 报 NDK 相关 → 可在 workflow 的 `env` 增 `ANDROID_NDK_VERSION` 并用 `sdkmanager "ndk;<版本>"` 预装；
 - 报 Chaquopy/Python 下载失败 → 通常是网络抖动，重跑一次即可。
 这些都是 CI 环境的常规微调，与自动更新逻辑无关。
 
