@@ -105,7 +105,10 @@ public class App extends Application implements Application.ActivityLifecycleCal
         RuntimeInstaller.resumeUpdate(activity);
         Updater.get().notifyModules();
         // 进入前台时静默自动检查更新（带 12h 节流，已由 Updater 内部处理）
-        if (activity instanceof FragmentActivity) Updater.get().startAuto((FragmentActivity) activity);
+        if (activity instanceof FragmentActivity) {
+            Log.d("App", "onActivityResumed -> 触发 Updater.startAuto");
+            Updater.get().startAuto((FragmentActivity) activity);
+        }
     }
     @Override public void onActivityPaused(@NonNull Activity activity) { if (activity == activity()) this.activity = null; }
     @Override public void onActivityCreated(@NonNull Activity activity, @Nullable Bundle savedInstanceState) { }
