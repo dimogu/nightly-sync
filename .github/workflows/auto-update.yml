@@ -118,7 +118,8 @@ jobs:
         id: version
         working-directory: upstream-src
         run: |
-          VERSION=$(grep -oP 'versionName\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' app/build.gradle | head -1)
+          # 兼容多种写法：versionName "5.8.8" / versionName = "5.8.8" 等（官方当前用无等号写法）
+          VERSION=$(grep -oE 'versionName[^0-9]*[0-9]+\.[0-9]+\.[0-9]+' app/build.gradle | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -1)
           if [ -z "$VERSION" ]; then echo "未能提取版本号"; exit 1; fi
           echo "name=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
