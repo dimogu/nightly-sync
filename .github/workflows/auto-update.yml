@@ -20,7 +20,6 @@ permissions:
 env:
   REPO_TO: dimogu/nightly-sync
   APKTOOL_VER: 2.10.0
-  UBER_VER: 1.3.0
 
 jobs:
   repatch:
@@ -29,14 +28,25 @@ jobs:
       - name: 检出仓库（取 repatch.py）
         uses: actions/checkout@v4
 
-      - name: 安装 Java / apktool / uber-apk-signer
+      - name: 安装 Java / apktool
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq openjdk-17-jdk-headless python3 unzip wget
           echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
           wget -q "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_${APKTOOL_VER}.jar" -O apktool.jar
-          wget -q "https://github.com/patrickfav/uber-apk-signer/releases/download/v${UBER_VER}/uber-apk-signer-${UBER_VER}.jar" -O uber.jar
-          ls -la apktool.jar uber.jar
+          ls -la apktool.jar
+
+      - name: 准备签名工具（zipalign + apksigner）
+        id: bt
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1)
+          if [ -z "$BT" ]; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager "build-tools;34.0.0" >/dev/null
+            BT="$ANDROID_HOME/build-tools/34.0.0"
+          fi
+          echo "bt=$BT" >> "$GITHUB_OUTPUT"
+          "$BT/apksigner" --version
 
       - name: 取官方最新版本 & 判断是否需构建
         id: meta
@@ -74,21 +84,24 @@ jobs:
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
+          BT: ${{ steps.bt.outputs.bt }}
         run: |
           echo "$KEYSTORE_BASE64" | base64 -d > keystore.jks
-          mkdir -p dec out signed release
+          # 尽早验证 keystore 完整性与口令，避免到最后一步才发现问题
+          keytool -list -keystore keystore.jks -storepass "$STORE_PASSWORD" >/dev/null
+          mkdir -p dec out release
           for f in leanback-arm64_v8a leanback-armeabi_v7a mobile-arm64_v8a mobile-armeabi_v7a; do
             echo "=== 处理 $f ==="
             rm -rf "dec/$f"; java -jar apktool.jar d -r -f -o "dec/$f" "apks/$f.apk" >/dev/null
             python3 repatch.py "dec/$f" "$REPO_TO"
             java -jar apktool.jar b -c -f -o "out/$f-unsigned.apk" "dec/$f" >/dev/null
-            java -jar uber.jar --apks "out/$f-unsigned.apk" \
+            "$BT/zipalign" -f -p 4 "out/$f-unsigned.apk" "out/$f-aligned.apk"
+            "$BT/apksigner" sign \
               --ks keystore.jks --ks-key-alias "$KEY_ALIAS" \
               --ks-pass "pass:$STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" \
-              --out signed >/dev/null
-            s=$(ls signed/$f-unsigned*.apk 2>/dev/null | head -1)
-            cp "$s" "release/$f.apk"
-            echo "release/$f.apk <- $s"
+              --out "release/$f.apk" "out/$f-aligned.apk"
+            "$BT/apksigner" verify "release/$f.apk"
+            echo "release/$f.apk 签名完成"
           done
           ls -la release/
 
