@@ -79,9 +79,9 @@ jobs:
           mkdir -p dec out signed release
           for f in leanback-arm64_v8a leanback-armeabi_v7a mobile-arm64_v8a mobile-armeabi_v7a; do
             echo "=== 处理 $f ==="
-            rm -rf "dec/$f"; java -jar apktool.jar d -f -o "dec/$f" "apks/$f.apk" >/dev/null
+            rm -rf "dec/$f"; java -jar apktool.jar d -r -f -o "dec/$f" "apks/$f.apk" >/dev/null
             python3 repatch.py "dec/$f" "$REPO_TO"
-            java -jar apktool.jar b -f -o "out/$f-unsigned.apk" "dec/$f" >/dev/null
+            java -jar apktool.jar b -c -f -o "out/$f-unsigned.apk" "dec/$f" >/dev/null
             java -jar uber.jar --apks "out/$f-unsigned.apk" \
               --ks keystore.jks --ks-key-alias "$KEY_ALIAS" \
               --ks-pass "pass:$STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" \
