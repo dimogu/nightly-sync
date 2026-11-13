@@ -111,7 +111,12 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="v${{ steps.meta.outputs.official }}"
-          gh release create "$TAG" \
-            --title "fongmi 自动更新版 $TAG" \
-            --notes "由 dimogu/nightly-sync 自动重打包：更新源指向本仓库 + 启动即静默检查更新。首次安装请先卸载官方原版（签名不同）。仅供个人使用。" \
-            release/*.apk
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            # 已存在（并发 run 撞车或补传场景）→ 幂等覆盖上传
+            gh release upload "$TAG" release/*.apk --clobber
+          else
+            gh release create "$TAG" \
+              --title "fongmi 自动更新版 $TAG" \
+              --notes "由 dimogu/nightly-sync 自动重打包：更新源指向本仓库 + 启动即静默检查更新。首次安装请先卸载官方原版（签名不同）。仅供个人使用。" \
+              release/*.apk
+          fi
