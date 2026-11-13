@@ -29,7 +29,6 @@ env:
   # 构建环境取自官方 gradle/libs.versions.toml（2026-11 快照）
   ANDROID_COMPILE_SDK: "37"
   ANDROID_BUILD_TOOLS: "37.0.0"
-  ANDROID_NDK_VERSION: "27.0.12077973"
   JAVA_VERSION: "21"
 
 jobs:
@@ -60,23 +59,30 @@ jobs:
           distribution: 'temurin'
           java-version: ${{ env.JAVA_VERSION }}
 
-      - name: 安装 Android SDK / NDK
-        uses: android-actions/setup-android@v3
-
-      - name: 安装 SDK 组件并同意协议
+      # 手动安装 Android SDK（不使用 android-actions/setup-android，因其会在新版 cmdline-tools 上
+      # 尝试安装已废弃的 "tools" 包而失败）。NDK 交给 Gradle 按需自动下载，避免版本猜错。
+      - name: 安装 Android SDK（cmdline-tools + platform + build-tools）
         run: |
-          yes | sdkmanager --licenses >/dev/null || true
-          sdkmanager "platforms;android-${{ env.ANDROID_COMPILE_SDK }}" "build-tools;${{ env.ANDROID_BUILD_TOOLS }}" "ndk;${{ env.ANDROID_NDK_VERSION }}"
-          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> "$GITHUB_ENV"
-          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> "$GITHUB_ENV"
+          SDK=$HOME/android-sdk
+          mkdir -p "$SDK/cmdline-tools"
+          curl -fsSL -o ct.zip https://dl.google.com/android/repository/commandlinetools-linux-11076708_latest.zip
+          unzip -q ct.zip -d "$SDK/cmdline-tools"
+          mv "$SDK/cmdline-tools/cmdline-tools" "$SDK/cmdline-tools/latest"
+          export PATH="$SDK/cmdline-tools/latest/bin:$PATH"
+          yes | sdkmanager --licenses >/dev/null
+          sdkmanager "platform-tools" "platforms;android-${{ env.ANDROID_COMPILE_SDK }}" "build-tools;${{ env.ANDROID_BUILD_TOOLS }}"
+          {
+            echo "ANDROID_HOME=$SDK"
+            echo "ANDROID_SDK_ROOT=$SDK"
+          } >> "$GITHUB_ENV"
 
-      - name: 从 Secret 还原签名 keystore + local.properties
+      - name: 从 Secret 还原签名 keystore + local.properties（位于仓库根，官方 build.gradle 会从这里读取）
         run: |
           echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > "$GITHUB_WORKSPACE/keystore.jks"
           {
             echo "storeFile=$GITHUB_WORKSPACE/keystore.jks"
             echo "keyAlias=${{ secrets.KEY_ALIAS }}"
-            echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
+            echo "keyPassword=${{ secrets.STORE_PASSWORD }}"
             echo "storePassword=${{ secrets.STORE_PASSWORD }}"
           } > upstream-src/local.properties
 
@@ -84,11 +90,21 @@ jobs:
         working-directory: upstream-src
         run: chmod +x ./gradlew
 
-      - name: 读取版本号（取自官方 app/build.gradle 的 versionName）
+      # 缓存 Gradle 依赖，加速后续构建
+      - name: 缓存 Gradle 依赖
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.gradle/caches
+            ~/.gradle/wrapper
+          key: gradle-deps-${{ runner.os }}
+
+      - name: 读取版本号（取自官方 app/build.gradle 的 versionName，注意带等号）
         id: version
         working-directory: upstream-src
         run: |
-          VERSION=$(grep -oP 'versionName "\K[0-9]+\.[0-9]+\.[0-9]+' app/build.gradle | head -1)
+          VERSION=$(grep -oP 'versionName\s*=\s*"\K[0-9]+\.[0-9]+\.[0-9]+' app/build.gradle | head -1)
+          if [ -z "$VERSION" ]; then echo "未能提取版本号"; exit 1; fi
           echo "name=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
           echo "当前版本：v$VERSION"
@@ -108,7 +124,7 @@ jobs:
       - name: 编译 Release APK（电视版 + 手机版，双 ABI）
         if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
         working-directory: upstream-src
-        run: ./gradlew assembleLeanbackRelease assembleMobileRelease --no-daemon
+        run: ./gradlew assembleLeanbackRelease assembleMobileRelease --no-daemon -Dorg.gradle.jvmargs="-Xmx4g -XX:MaxMetaspaceSize=512m"
 
       - name: 重命名为 App 更新器期望的文件名
         if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
@@ -122,9 +138,15 @@ jobs:
               *leanback*armeabi*) cp "$f" artifacts/leanback-armeabi_v7a.apk ;;
               *mobile*arm64*)     cp "$f" artifacts/mobile-arm64_v8a.apk ;;
               *mobile*armeabi*)   cp "$f" artifacts/mobile-armeabi_v7a.apk ;;
+              *) echo "  未匹配的 APK 名: $n" ;;
             esac
           done
+          echo "=== 产物清单 ==="
           ls -lh artifacts
+          # 强校验：必须产出 4 个预期文件，否则构建产物命名有变，及时报错
+          for expected in leanback-arm64_v8a.apk leanback-armeabi_v7a.apk mobile-arm64_v8a.apk mobile-armeabi_v7a.apk; do
+            [ -f "artifacts/$expected" ] || { echo "缺少预期产物: $expected"; exit 1; }
+          done
 
       - name: 生成 Release 说明
         if: steps.tagcheck.outputs.exists == 'false' || github.event.inputs.force == 'true'
