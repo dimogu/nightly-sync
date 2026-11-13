@@ -110,6 +110,30 @@ jobs:
         working-directory: upstream-src
         run: chmod +x ./gradlew
 
+      # 准备 mpv / ffmpeg 预编译 aar（FongMi 私有构建产物，官方从不发布，需自行提供一次）
+      # 这两个 aar 是 FongMi/TV 编译的硬性前置依赖：lib-mpvplayer-release.aar 与 lib-decoder-ffmpeg-release.aar。
+      # 来源：用 FongMi 的 mpv library 构建方式产出，或从你已有的 FongMi/TV 编译环境中取得。
+      # 获取后上传到本仓库的 Release（tag 固定为 mpv-libs），本步骤会自动下载复用；缺失则给出明确指引并终止。
+      - name: 准备 mpv/ffmpeg 预编译 aar（外部依赖，需自行提供一次）
+        working-directory: upstream-src
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          mkdir -p app/libs
+          for aar in lib-mpvplayer-release.aar lib-decoder-ffmpeg-release.aar; do
+            if gh release download mpv-libs -R "${{ github.repository }}" -p "$aar" -D app/libs 2>/dev/null; then
+              echo "已获取 $aar"
+            else
+              echo "::error::缺少 $aar —— FongMi/TV 编译必需的 mpv/ffmpeg 预编译库（FongMi 私有构建产物，官方不发布、无公开下载源）"
+              echo "::error::请在本仓库创建 Release（tag 固定为 mpv-libs），并上传这两个 aar："
+              echo "::error::  1) lib-mpvplayer-release.aar"
+              echo "::error::  2) lib-decoder-ffmpeg-release.aar"
+              echo "::error::来源：用 FongMi 的 mpv library 构建产出，或从你已有的 FongMi/TV 编译环境中取得"
+              exit 1
+            fi
+          done
+          ls -la app/libs
+
       # 缓存 Gradle 依赖，加速后续构建
       - name: 缓存 Gradle 依赖
         uses: actions/cache@v4
