@@ -23,26 +23,6 @@ jobs:
       - name: 检出
         uses: actions/checkout@v4
 
-      - name: 安装 Java / apktool
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq openjdk-17-jdk-headless python3 unzip wget
-          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
-          wget -q "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_${APKTOOL_VER}.jar" -O apktool.jar
-          ls -la apktool.jar
-
-      - name: 准备签名工具
-        id: bt
-        run: |
-          BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1)
-          if [ -z "$BT" ]; then
-            yes | sdkmanager --licenses >/dev/null 2>&1 || true
-            sdkmanager "build-tools;34.0.0" >/dev/null
-            BT="$ANDROID_HOME/build-tools/34.0.0"
-          fi
-          echo "bt=$BT" >> "$GITHUB_OUTPUT"
-          "$BT/apksigner" --version
-
       - name: 获取版本并判断
         id: meta
         env:
@@ -53,7 +33,10 @@ jobs:
           OURS=$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)
           echo "ours=$OURS"
           echo "official=$OFFICIAL" >> "$GITHUB_OUTPUT"
-          if [ "${OURS#v}" = "$OFFICIAL" ]; then
+          if [ "${{ github.event_name }}" = "push" ]; then
+            # 推送补丁脚本时强制重建，使改进立即生效于已发布版本
+            echo "skip=false" >> "$GITHUB_OUTPUT"
+          elif [ "${OURS#v}" = "$OFFICIAL" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -62,6 +45,28 @@ jobs:
       - name: 已是最新
         if: steps.meta.outputs.skip == 'true'
         run: echo "版本 ${{ steps.meta.outputs.official }} 已处理，跳过"
+
+      - name: 安装 Java / apktool
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq openjdk-17-jdk-headless python3 unzip wget
+          echo "JAVA_HOME=/usr/lib/jvm/java-17-openjdk-amd64" >> "$GITHUB_ENV"
+          wget -q "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_${APKTOOL_VER}.jar" -O apktool.jar
+          ls -la apktool.jar
+
+      - name: 准备签名工具
+        id: bt
+        if: steps.meta.outputs.skip != 'true'
+        run: |
+          BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1)
+          if [ -z "$BT" ]; then
+            yes | sdkmanager --licenses >/dev/null 2>&1 || true
+            sdkmanager "build-tools;34.0.0" >/dev/null
+            BT="$ANDROID_HOME/build-tools/34.0.0"
+          fi
+          echo "bt=$BT" >> "$GITHUB_OUTPUT"
+          "$BT/apksigner" --version
 
       - name: 下载发布产物
         if: steps.meta.outputs.skip != 'true'
@@ -81,7 +86,7 @@ jobs:
           STORE_PASSWORD: ${{ secrets.STORE_PASSWORD }}
           BT: ${{ steps.bt.outputs.bt }}
         run: |
-          echo "$KEYSTORE_BASE64" | base64 -d > keystore.jks
+          echo "$KEYSTORE_BASE64" | base64 -d --ignore-garbage > keystore.jks
           keytool -list -keystore keystore.jks -storepass "$STORE_PASSWORD" >/dev/null
           mkdir -p dec out release
           for f in leanback-arm64_v8a leanback-armeabi_v7a mobile-arm64_v8a mobile-armeabi_v7a; do
@@ -105,12 +110,42 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG="${{ steps.meta.outputs.official }}"
-          if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release upload "$TAG" release/*.apk --clobber
-            gh release edit "$TAG" --title "$TAG" --notes ""
+          publish() {
+            if gh release view "$TAG" >/dev/null 2>&1; then
+              gh release upload "$TAG" release/*.apk --clobber
+              gh release edit "$TAG" --title "$TAG" --notes ""
+            else
+              gh release create "$TAG" \
+                --title "$TAG" \
+                --notes "" \
+                release/*.apk
+            fi
+          }
+          for i in 1 2 3; do
+            if publish; then
+              echo "发布成功（第 $i 次尝试）"
+              exit 0
+            fi
+            echo "发布失败，第 $i 次重试..."
+            sleep 15
+          done
+          echo "发布多次失败"
+          exit 1
+
+      - name: keep-alive
+        if: github.event_name == 'schedule'
+        run: |
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git config user.name "github-actions[bot]"
+          TODAY=$(date -u +%F)
+          PREV=""
+          [ -f .lastrun ] && PREV=$(cat .lastrun)
+          if [ "$PREV" != "$TODAY" ]; then
+            echo "$TODAY" > .lastrun
+            git add .lastrun
+            git commit -m "keepalive: $TODAY"
+            git push
+            echo "心跳已提交：$TODAY"
           else
-            gh release create "$TAG" \
-              --title "$TAG" \
-              --notes "" \
-              release/*.apk
+            echo "今日已心跳，跳过"
           fi
