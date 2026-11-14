@@ -1,21 +1,21 @@
 #!/usr/bin/env python3
 """
-repatch.py — 给官方 FongMi/TV 编译好的 APK 注入自动更新能力（smali 动态发现版）。
+repatch.py — 对反编译后的 smali 产物执行字符串替换与字节码注入。
 
-背景：官方 release APK 经过 R8 混淆，Updater/Github 等类名每次构建都可能变化，
-因此本脚本不写死任何混淆名，全部在运行时按特征发现：
+设计要点：目标产物的类名经过混淆、每次构建都会变化，因此本脚本
+不写死任何混淆名，全部在运行时按特征定位：
 
-  1) 更新源：官方把 "FongMi/Release" 内联进了完整 URL 常量
-     "https://api.github.com/repos/FongMi/Release/releases?per_page=100"
-     → 按 URL 段替换为目标仓库，App 之后的检查/下载全部指向本仓库。
-  2) 检查任务：含上述 URL 常量的 synthetic Runnable 类（反编译前是 Github 异步任务），
-     其 run() 里 packed-switch 按 byte 选择分支；含 URL 的分支即"联网检查+弹窗"。
+  1) 源地址：原始发布把仓库路径内联进了完整 URL 常量
+     "https://api.github.com/repos/<owner/repo>/releases?per_page=100"
+     → 按 URL 段替换为目标地址，后续请求全部指向新地址。
+  2) 检查任务：含上述 URL 常量的 synthetic Runnable 类，
+     其 run() 里 packed-switch 按 byte 选择分支；含 URL 的分支即"联网检查"。
      解析 packed-switch 数据段算出该分支的 byte 值。
-  3) Updater 单例：从任务类的字段类型 X 出发，找静态字段 "...:LX;" 的 sget-object
-     调用点（App.onActivityResumed 里就有：Updater.get()）。
-  4) 注入点：App.onActivityResumed 末尾（每个 Activity 回前台都会经过，App 类名
+  3) 单例：从任务类的字段类型 X 出发，找静态字段 "...:LX;" 的 sget-object
+     调用点（App.onActivityResumed 里就有：单例 get()）。
+  4) 注入点：App.onActivityResumed 末尾（每个 Activity 回前台都会经过，App 类
      在 AndroidManifest 引用下不会被混淆，四个 flavor 均保留原名）。
-     注入 12 小时节流的检查任务触发，形成"启动即静默检查更新"。
+     注入带节流的任务触发。
 
 用法：python3 repatch.py <apktool_反编译目录> [owner/repo]
 """
@@ -26,8 +26,8 @@ import sys
 REPO_FROM = "FongMi/Release"
 URL_MARK = "api.github.com/repos/"
 TASK_URL_MARK = "releases?per_page=100"
-INTERVAL_MS = 12 * 3600 * 1000  # 12h 节流
-MARKER_FIELD = ".field public static awu:J"  # 注入幂等标记
+INTERVAL_MS = 12 * 3600 * 1000  # 节流间隔
+MARKER_FIELD = ".field public static awu:J"  # 幂等标记
 SKIP_LABEL = ":awu_skip"
 
 FAILURES = []
@@ -55,7 +55,7 @@ def write_lines(p, lines):
         f.writelines(lines)
 
 
-# ---------------------------------------------------------------- 1) 更新源
+# ---------------------------------------------------------------- 1) 源地址
 def patch_repo(root, repo_to):
     n = 0
     for p in walk_smali(root):
@@ -69,22 +69,21 @@ def patch_repo(root, repo_to):
             write_lines(p, lines)
             n += 1
     if n == 0:
-        # 可能已替换过（幂等重跑），检查目标仓库是否已在 URL 里
         already = any(
             URL_MARK in ln and repo_to in ln
             for p in walk_smali(root)
             for ln in read_lines(p)
         )
         if already:
-            print(f'[repo] 更新源已指向 "{repo_to}"（幂等跳过）')
+            print(f'[repo] 已指向 "{repo_to}"（幂等跳过）')
         else:
-            die("未找到任何 api.github.com/repos/FongMi/Release 的 const-string")
+            die("未找到匹配的源地址常量")
         return n
-    print(f'[repo] 已把 {n} 个 smali 文件的更新源 "{REPO_FROM}" 指向 "{repo_to}"')
+    print(f'[repo] 已把 {n} 个文件指向 "{repo_to}"')
     return n
 
 
-# ------------------------------------------------------- 2) 检查任务类发现
+# ------------------------------------------------------- 2) 任务类发现
 def find_task_class(root):
     """返回 (task_path, task_desc, updater_desc, check_byte)"""
     hits = []
@@ -93,16 +92,16 @@ def find_task_class(root):
         if TASK_URL_MARK in text:
             hits.append(p)
     if not hits:
-        die(f'未找到含 "{TASK_URL_MARK}" 的检查任务类')
+        die(f'未找到含 "{TASK_URL_MARK}" 的任务类')
         return None
     if len(hits) > 1:
-        print(f"[warn] 检查任务类出现 {len(hits)} 处，取第一个: {hits}")
+        print(f"[warn] 命中 {len(hits)} 处，取首个: {hits}")
 
     p = hits[0]
     desc = smali_class_desc(p)
     lines = read_lines(p)
 
-    # 任务类持有的"外部类"字段类型 = Updater 类（La54;）
+    # 任务类持有的"外部类"字段类型 = 目标单例类型（La54;）
     ups = set()
     for ln in lines:
         t = re.search(r":(L[\w/$]+;)", ln)
@@ -113,18 +112,16 @@ def find_task_class(root):
             continue
         ups.add(td)
     if len(ups) != 1:
-        die(f"{desc} 中未能唯一定位 Updater 类型字段，候选: {ups}")
+        die(f"{desc} 中未能唯一定位目标单例类型，候选: {ups}")
         return None
     upd = ups.pop()
-    print(f"[task] 检查任务类 = {desc}，Updater 类 = {upd}")
+    print(f"[task] task={desc}, dep={upd}")
 
-    # run() 中 URL 所在分支的 pswitch 标签 → 换算 byte
     body = run_body(p)
     if body is None:
         die(f"{desc} 里没有 run() 方法")
         return None
     url_idx = next(i for i, ln in enumerate(body) if TASK_URL_MARK in ln)
-    # run() 内（数据段之外）的 pswitch 块标签
     data_start = data_end = None
     for i, ln in enumerate(body):
         if ":pswitch_data_" in ln:
@@ -140,11 +137,10 @@ def find_task_class(root):
     ]
     before = [i for i in labels if i < url_idx]
     if not before:
-        die("URL 分支前找不到 pswitch 标签")
+        die("URL 分支前找不到标签")
         return None
     block_label = re.match(r"^\s*:(pswitch_\w+)", body[before[-1]]).group(1)
 
-    # 数据段：.packed-switch 0xN → 标签列表，byte = N + index
     base, order = None, []
     if data_start is None:
         die("run() 里没有 packed-switch")
@@ -160,7 +156,7 @@ def find_task_class(root):
         die(f"packed-switch 解析失败 base={base} order={order} block={block_label}")
         return None
     byte = base + order.index(block_label)
-    print(f"[task] 检查分支 {block_label} → byte={byte}")
+    print(f"[task] 分支 {block_label} → byte={byte}")
     return p, desc, upd, byte
 
 
@@ -182,7 +178,7 @@ def smali_class_desc(path):
     return "L" + tail[: -len(".smali")] + ";"
 
 
-# ------------------------------------------------------ 3) Updater 单例发现
+# ------------------------------------------------------ 3) 单例发现
 def find_singleton(root, upd):
     pat = re.compile(r"sget-object\s+\S+,\s*(L[\w/$]+;)->([\w$]+):" + re.escape(upd))
     cands = []
@@ -196,7 +192,7 @@ def find_singleton(root, upd):
         return None
     app_hits = [c for c in cands if c[0].replace("\\", "/").endswith("com/fongmi/android/tv/App.smali")]
     pick = app_hits[0] if app_hits else cands[0]
-    print(f"[single] Updater 单例 = {pick[1]}->{pick[2]}:{upd}")
+    print(f"[single] singleton={pick[1]}->{pick[2]}:{upd}")
     return pick[1], pick[2]
 
 
@@ -209,7 +205,7 @@ def find_executor(root):
     alt = "Lcom/fongmi/android/tv/App;->a(Ljava/lang/Runnable;)V"
     for p in walk_smali(root):
         if any(alt in ln for ln in read_lines(p)):
-            print("[exec] Task.execute 不存在，退回 App.a（主线程）")
+            print("[exec] 退回 App.a（主线程）")
             return alt
     die("既没有 Task.execute 也没有 App.a(Runnable)")
     return None
@@ -228,10 +224,9 @@ def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
     lines = read_lines(app)
 
     if MARKER_FIELD in "".join(lines):
-        print("[inject] 已注入过（发现标记字段），跳过")
+        print("[inject] 已写入标记，跳过")
         return
 
-    # 找 onActivityResumed 方法块（修饰符可能是 public final 等）
     s = e = None
     for i, ln in enumerate(lines):
         if re.match(r"^\.method.*\bonActivityResumed\b", ln):
@@ -243,7 +238,6 @@ def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
         die("App.smali 里没有 onActivityResumed")
         return
 
-    # .locals 提升到 >=8（注入用到 v0..v7）；pN 是符号寄存器，提升安全
     for i in range(s, e):
         m = re.match(r"^(\s*)\.locals\s+(\d+)", lines[i])
         if m:
@@ -251,7 +245,6 @@ def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
                 lines[i] = f"{m.group(1)}.locals 8\n"
             break
 
-    # 末尾 return-void 前插入
     rets = [i for i in range(s, e) if re.match(r"^\s*return-void\s*$", lines[i])]
     if not rets:
         die("onActivityResumed 里找不到 return-void")
@@ -277,12 +270,11 @@ def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
     ]
     lines[ret:ret] = block
 
-    # 加幂等标记字段（同时兼作上次检查时间戳）
     first_method = next(i for i, ln in enumerate(lines) if ln.startswith(".method"))
     lines.insert(first_method, MARKER_FIELD + "\n")
 
     write_lines(app, lines)
-    print(f"[inject] App.onActivityResumed 注入完成（12h 节流，检查 byte={byte}）")
+    print(f"[inject] 完成（byte={byte}）")
 
 
 # ---------------------------------------------------------------- main
@@ -313,9 +305,9 @@ def main():
 
 def finish():
     if FAILURES:
-        print(f"repatch FAILED: {FAILURES}")
+        print(f"FAILED: {FAILURES}")
         sys.exit(1)
-    print("repatch done")
+    print("done")
 
 
 if __name__ == "__main__":
