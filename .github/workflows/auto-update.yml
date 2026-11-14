@@ -1,10 +1,4 @@
-name: repatch-auto-update
-
-# 重打包官方已编译 APK，注入自动更新（绕开私有 aar 编译门槛）。
-# 流程：每 6 小时检查 FongMi/Release 是否有新版 →
-#   下载官方 4 个 APK → apktool 反编译 → repatch.py 改更新源+注入自动检查 →
-#   重打包 → 用本仓库签名 keystore 重签名 → 发到本仓库 Release（同名 APK）。
-# App 更新源指向本仓库，升级上来的版本依旧带自更新，形成闭环。
+name: build
 
 on:
   schedule:
@@ -18,14 +12,15 @@ permissions:
   contents: write
 
 env:
+  SRC_REPO: FongMi/Release
   REPO_TO: dimogu/nightly-sync
   APKTOOL_VER: 2.10.0
 
 jobs:
-  repatch:
+  build:
     runs-on: ubuntu-latest
     steps:
-      - name: 检出仓库（取 repatch.py）
+      - name: 检出
         uses: actions/checkout@v4
 
       - name: 安装 Java / apktool
@@ -36,7 +31,7 @@ jobs:
           wget -q "https://bitbucket.org/iBotPeaches/apktool/downloads/apktool_${APKTOOL_VER}.jar" -O apktool.jar
           ls -la apktool.jar
 
-      - name: 准备签名工具（zipalign + apksigner）
+      - name: 准备签名工具
         id: bt
         run: |
           BT=$(ls -d "$ANDROID_HOME"/build-tools/* 2>/dev/null | sort -V | tail -1)
@@ -48,12 +43,12 @@ jobs:
           echo "bt=$BT" >> "$GITHUB_OUTPUT"
           "$BT/apksigner" --version
 
-      - name: 取官方最新版本 & 判断是否需构建
+      - name: 获取版本并判断
         id: meta
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          OFFICIAL=$(gh api repos/FongMi/Release/releases/latest --jq '.tag_name')
+          OFFICIAL=$(gh api repos/$SRC_REPO/releases/latest --jq '.tag_name')
           echo "official=$OFFICIAL"
           OURS=$(gh release list --limit 1 --json tagName -q '.[0].tagName' || true)
           echo "ours=$OURS"
@@ -64,20 +59,20 @@ jobs:
             echo "skip=false" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: 跳过（已是最新）
+      - name: 已是最新
         if: steps.meta.outputs.skip == 'true'
-        run: echo "官方版本 ${{ steps.meta.outputs.official }} 已发布，跳过"
+        run: echo "版本 ${{ steps.meta.outputs.official }} 已处理，跳过"
 
-      - name: 下载官方 4 个 APK
+      - name: 下载发布产物
         if: steps.meta.outputs.skip != 'true'
         run: |
           mkdir -p apks
           for f in leanback-arm64_v8a leanback-armeabi_v7a mobile-arm64_v8a mobile-armeabi_v7a; do
-            curl -sSL -o "apks/$f.apk" "https://github.com/FongMi/Release/releases/download/${{ steps.meta.outputs.official }}/$f.apk"
+            curl -sSL -o "apks/$f.apk" "https://github.com/$SRC_REPO/releases/download/${{ steps.meta.outputs.official }}/$f.apk"
             echo "$f.apk -> $(wc -c < apks/$f.apk) bytes"
           done
 
-      - name: 反编译 + 注入 + 重打包 + 签名
+      - name: 处理并签名
         if: steps.meta.outputs.skip != 'true'
         env:
           KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
@@ -87,7 +82,6 @@ jobs:
           BT: ${{ steps.bt.outputs.bt }}
         run: |
           echo "$KEYSTORE_BASE64" | base64 -d > keystore.jks
-          # 尽早验证 keystore 完整性与口令，避免到最后一步才发现问题
           keytool -list -keystore keystore.jks -storepass "$STORE_PASSWORD" >/dev/null
           mkdir -p dec out release
           for f in leanback-arm64_v8a leanback-armeabi_v7a mobile-arm64_v8a mobile-armeabi_v7a; do
@@ -101,26 +95,22 @@ jobs:
               --ks-pass "pass:$STORE_PASSWORD" --key-pass "pass:$KEY_PASSWORD" \
               --out "release/$f.apk" "out/$f-aligned.apk"
             "$BT/apksigner" verify "release/$f.apk"
-            echo "release/$f.apk 签名完成"
+            echo "release/$f.apk 完成"
           done
           ls -la release/
 
-      - name: 发布到本仓库 Release
+      - name: 发布产物
         if: steps.meta.outputs.skip != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # tag 必须与官方完全一致（不带 v 前缀），否则 App 端版本比对永远匹配不上
           TAG="${{ steps.meta.outputs.official }}"
-          # 复用官方同版本 release 的标题与说明，外观与官方一致、不暴露改造痕迹
-          OFF_BODY=$(gh api repos/FongMi/Release/releases/tags/"$TAG" --jq '.body // ""')
           if gh release view "$TAG" >/dev/null 2>&1; then
-            # 已存在（并发 run 撞车或补传场景）→ 幂等覆盖上传，并同步标题/说明
             gh release upload "$TAG" release/*.apk --clobber
-            gh release edit "$TAG" --title "$TAG" --notes "$OFF_BODY"
+            gh release edit "$TAG" --title "$TAG" --notes ""
           else
             gh release create "$TAG" \
               --title "$TAG" \
-              --notes "$OFF_BODY" \
+              --notes "" \
               release/*.apk
           fi
