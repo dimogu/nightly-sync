@@ -277,6 +277,69 @@ def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
     print(f"[inject] 完成（byte={byte}）")
 
 
+# ------------------------------------------------ 5) 放行运行时签名校验
+def patch_runtime_signer(root):
+    """官方把 runtime 模块（MPV/Python/Node.js/QuickJS/Thunder 等）设计为
+    必须用与宿主一致的签名；重签名后模块仍是官方签名，verifyPackage 必失败。
+    模块是独立安装包（系统安装已成功），此处仅放行 App 层的签名校验。"""
+    # 5a) 共享校验：com/github/catvod/utils/RuntimeModule.verifyPackage
+    rt = None
+    for p in walk_smali(root):
+        if p.replace("\\", "/").endswith("com/github/catvod/utils/RuntimeModule.smali"):
+            rt = p
+            break
+    if rt is None:
+        die("未找到 RuntimeModule.smali")
+        return
+    lines = read_lines(rt)
+    if "Invalid runtime signer" in "".join(lines):
+        idx = next(i for i, ln in enumerate(lines) if "Invalid runtime signer" in ln)
+        j = idx
+        while j < len(lines) and "throw p0" not in lines[j]:
+            j += 1
+        k = idx
+        while k >= 0 and not lines[k].strip().startswith(":cond_1"):
+            k -= 1
+        if k >= 0 and j < len(lines):
+            lines[k : j + 1] = ["    :cond_1\n", "    return-void\n"]
+            write_lines(rt, lines)
+            print("[runtime] 共享 verifyPackage 签名校验已放行")
+        else:
+            die("RuntimeModule 签名校验块定位失败")
+    else:
+        print("[runtime] 共享校验已处理（幂等跳过）")
+
+    # 5b) BD-J 专属校验（混淆名不定，按内容定位）
+    bdj = None
+    for p in walk_smali(root):
+        if any("Invalid BD-J runtime signer" in ln for ln in read_lines(p)):
+            bdj = p
+            break
+    if bdj is None:
+        print("[runtime] 未找到 BD-J 校验，跳过")
+        return
+    lines = read_lines(bdj)
+    ci = None
+    for i, ln in enumerate(lines):
+        if "containsAll(Ljava/util/Collection;)Z" in ln:
+            ci = i
+            break
+    if ci is None:
+        print("[runtime] BD-J 未找到 containsAll，跳过")
+        return
+    ti = None
+    for i in range(ci, min(ci + 15, len(lines))):
+        if re.match(r"^\s*if-eqz v5, :cond_c\s*$", lines[i]):
+            ti = i
+            break
+    if ti is None:
+        print("[runtime] BD-J 签名校验已处理（幂等跳过）")
+        return
+    lines[ti] = "    # patched: 跳过 BD-J 运行时签名校验\n"
+    write_lines(bdj, lines)
+    print("[runtime] BD-J 签名校验已放行")
+
+
 # ---------------------------------------------------------------- main
 def main():
     if len(sys.argv) < 2:
@@ -300,6 +363,7 @@ def main():
         finish()
         return
     inject(root, s[0], s[1], upd, task_desc, byte, ex)
+    patch_runtime_signer(root)
     finish()
 
 
