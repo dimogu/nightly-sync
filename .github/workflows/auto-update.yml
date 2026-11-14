@@ -10,6 +10,7 @@ on:
 
 permissions:
   contents: write
+  issues: write
 
 env:
   SRC_REPO: FongMi/Release
@@ -36,7 +37,7 @@ jobs:
           if [ "${{ github.event_name }}" = "push" ]; then
             # 推送补丁脚本时强制重建，使改进立即生效于已发布版本
             echo "skip=false" >> "$GITHUB_OUTPUT"
-          elif [ "${OURS#v}" = "$OFFICIAL" ]; then
+          elif [ "${OURS#v}" = "${OFFICIAL#v}" ]; then
             echo "skip=true" >> "$GITHUB_OUTPUT"
           else
             echo "skip=false" >> "$GITHUB_OUTPUT"
@@ -74,7 +75,12 @@ jobs:
           mkdir -p apks
           for f in leanback-arm64_v8a leanback-armeabi_v7a mobile-arm64_v8a mobile-armeabi_v7a; do
             curl -sSL -o "apks/$f.apk" "https://github.com/$SRC_REPO/releases/download/${{ steps.meta.outputs.official }}/$f.apk"
-            echo "$f.apk -> $(wc -c < apks/$f.apk) bytes"
+            SZ=$(wc -c < "apks/$f.apk")
+            if [ "$SZ" -lt 1000000 ]; then
+              echo "下载异常：$f.apk 仅 $SZ 字节（官方或已改 asset 命名）"
+              exit 1
+            fi
+            echo "$f.apk -> $SZ bytes"
           done
 
       - name: 处理并签名
@@ -133,7 +139,7 @@ jobs:
           exit 1
 
       - name: keep-alive
-        if: github.event_name == 'schedule'
+        if: always()
         run: |
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
@@ -148,4 +154,18 @@ jobs:
             echo "心跳已提交：$TODAY"
           else
             echo "今日已心跳，跳过"
+          fi
+
+      - name: 构建失败通知
+        if: failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TITLE="nightly-sync 构建失败"
+          EXIST=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "$TITLE" --json number -q '.[0].number' 2>/dev/null || true)
+          BODY="自动更新流水线失败，请检查：https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          if [ -n "$EXIST" ]; then
+            gh issue comment "$EXIST" --repo "$GITHUB_REPOSITORY" --body "再次失败：$(date -u +%FT%TZ) run ${{ github.run_id }}" || true
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$TITLE" --body "$BODY" || true
           fi
