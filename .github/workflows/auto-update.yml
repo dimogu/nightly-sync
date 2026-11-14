@@ -110,7 +110,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG="v${{ steps.meta.outputs.official }}"
+          # tag 必须与官方完全一致（不带 v 前缀），否则 App 端版本比对永远匹配不上
+          TAG="${{ steps.meta.outputs.official }}"
           if gh release view "$TAG" >/dev/null 2>&1; then
             # 已存在（并发 run 撞车或补传场景）→ 幂等覆盖上传
             gh release upload "$TAG" release/*.apk --clobber
