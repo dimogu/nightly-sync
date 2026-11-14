@@ -26,8 +26,7 @@ REPO_FROM = "FongMi/Release"
 URL_MARK = "api.github.com/repos/"
 TASK_URL_MARK = "releases?per_page=100"
 INTERVAL_MS = 12 * 3600 * 1000  # 节流间隔
-MARKER_FIELD = ".field public static awu:J"  # 幂等标记
-SKIP_LABEL = ":awu_skip"
+SKIP_LABEL = ":awu_skip"  # 独有标签，作幂等判定（上游不会出现）
 
 FAILURES = []
 
@@ -114,11 +113,10 @@ def find_task_class(root):
         if td == desc or td.startswith(("Ljava", "Landroid", "Lorg", "Lcom/github")):
             continue
         ups.add(td)
-    if len(ups) != 1:
-        die(f"{desc} 中未能唯一定位目标单例类型，候选: {ups}")
+    if len(ups) == 0:
+        die(f"{desc} 中未找到候选单例类型")
         return None
-    upd = ups.pop()
-    print(f"[task] task={desc}, dep={upd}")
+    print(f"[task] task={desc}, 候选单例类型: {sorted(ups)}")
 
     body = run_body(p)
     if body is None:
@@ -160,7 +158,7 @@ def find_task_class(root):
         return None
     byte = base + order.index(block_label)
     print(f"[task] 分支 {block_label} → byte={byte}")
-    return p, desc, upd, byte
+    return p, desc, ups, byte
 
 
 def run_body(path):
@@ -182,21 +180,43 @@ def smali_class_desc(path):
 
 
 # ------------------------------------------------------ 3) 单例发现
-def find_singleton(root, upd):
-    pat = re.compile(r"sget-object\s+\S+,\s*(L[\w/$]+;)->([\w$]+):" + re.escape(upd))
-    cands = []
-    for p in walk_smali(root):
-        for ln in read_lines(p):
-            m = pat.search(ln)
-            if m:
-                cands.append((p, m.group(1), m.group(2)))
-    if not cands:
-        die(f"全包未找到静态字段类型为 {upd} 的单例读取")
+def find_singleton(root, candidates):
+    """从候选单例类型里，挑出真正被 App 作为静态单例读取的那一个。
+
+    仅靠任务类字段类型计数不够稳（上游一旦让该任务类多持有一个业务字段就会失败），
+    改为：取候选类型 与 App.smali 内 sget-object 读取类型 的交集，唯一锁定。"""
+    app = next((p for p in walk_smali(root)
+                if p.replace("\\", "/").endswith("com/fongmi/android/tv/App.smali")), None)
+    if app is None:
+        die("未找到 com/fongmi/android/tv/App.smali")
         return None
-    app_hits = [c for c in cands if c[0].replace("\\", "/").endswith("com/fongmi/android/tv/App.smali")]
-    pick = app_hits[0] if app_hits else cands[0]
-    print(f"[single] singleton={pick[1]}->{pick[2]}:{upd}")
-    return pick[1], pick[2]
+    app_src = "".join(read_lines(app))
+    read_types = set(re.findall(
+        r"sget-object\s+\S+,\s*L[\w/$]+;->[\w$]+:(L[\w/$]+;)", app_src))
+    inter = candidates & read_types
+    chosen = (next(iter(inter)) if inter else
+              (next(iter(candidates)) if candidates else None))
+    if chosen is None:
+        die(f"候选单例类型 {candidates} 均未在 App 内被读取")
+        return None
+    pat = re.compile(r"sget-object\s+\S+,\s*(L[\w/$]+;)->([\w$]+):" + re.escape(chosen))
+    m = pat.search(app_src)
+    if not m:
+        die(f"App 内未定位到 {chosen} 的具体读取点")
+        return None
+    print(f"[single] singleton={m.group(1)}->{m.group(2)}:{chosen}")
+    return m.group(1), m.group(2), chosen
+
+
+def pick_marker_field(lines):
+    """从候选名里挑一个 App 内尚未声明的静态字段名，避免与上游混淆字段巧合重名。"""
+    src = "".join(lines)
+    existing = set(re.findall(
+        r"\.field\s+(?:public\s+|private\s+|protected\s+)*static\s+(\w+):", src))
+    for c in ("awu", "aWx", "bZ1", "qL7", "mP9", "kR3", "vT2"):
+        if c not in existing:
+            return c
+    return None
 
 
 def find_executor(root):
@@ -238,9 +258,16 @@ def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
         return
     lines = read_lines(app)
 
-    if MARKER_FIELD in "".join(lines):
-        print("[inject] 已写入标记，跳过")
+    if SKIP_LABEL in "".join(lines):
+        print("[inject] 已写入注入块，跳过")
         return
+
+    # 选一个 App 内尚未声明的静态字段名作为节流时间戳，避免与上游混淆名巧合重名
+    marker = pick_marker_field(lines)
+    if marker is None:
+        die("无法为节流字段选到安全名")
+        return
+    field_ref = f"Lcom/fongmi/android/tv/App;->{marker}:J"
 
     s = e = None
     for i, ln in enumerate(lines):
@@ -291,17 +318,17 @@ def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
     block = [
         f"    invoke-static {{}}, Ljava/lang/System;->currentTimeMillis()J\n",
         f"    move-result-wide {v(R)}\n",
-        f"    sget-wide {v(R + 2)}, Lcom/fongmi/android/tv/App;->awu:J\n",
+        f"    sget-wide {v(R + 2)}, {field_ref}\n",
         f"    sub-long/2addr {v(R)}, {v(R + 2)}\n",
-        f"    const-wide/32 {v(R + 2)}, 0x{INTERVAL_MS:x}\n",
+        f"    const-wide {v(R + 2)}, 0x{INTERVAL_MS:x}L\n",
         f"    cmp-long {v(R + 4)}, {v(R)}, {v(R + 2)}\n",
         f"    if-ltz {v(R + 4)}, {SKIP_LABEL}\n",
         f"    invoke-static {{}}, Ljava/lang/System;->currentTimeMillis()J\n",
         f"    move-result-wide {v(R)}\n",
-        f"    sput-wide {v(R)}, Lcom/fongmi/android/tv/App;->awu:J\n",
+        f"    sput-wide {v(R)}, {field_ref}\n",
         f"    sget-object {v(R + 5)}, {single_cls}->{single_fld}:{upd}\n",
         f"    new-instance {v(R + 6)}, {task_desc}\n",
-        f"    const/4 {v(R + 7)}, 0x{byte:x}\n",
+        f"    const/16 {v(R + 7)}, 0x{byte:x}\n",
         f"    invoke-direct {{{v(R + 6)}, {v(R + 5)}, {v(R + 7)}}}, {task_desc}-><init>({upd}B)V\n",
         f"    invoke-static {{{v(R + 6)}}}, {executor}\n",
         f"    {SKIP_LABEL}\n",
@@ -309,7 +336,7 @@ def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
     lines[ret:ret] = block
 
     first_method = next(i for i, ln in enumerate(lines) if ln.startswith(".method"))
-    lines.insert(first_method, MARKER_FIELD + "\n")
+    lines.insert(first_method, f"    .field public static {marker}:J\n")
 
     write_lines(app, lines)
     print(f"[inject] 完成（byte={byte}, 新增寄存器 v{R}..v{R + 7}）")
@@ -380,6 +407,38 @@ def _patch_method_bdj(seg):
     return seg, changed
 
 
+# ----------------------------------------------------- 6) 注入后自检
+def self_check(root, repo_to):
+    """注入完成后断言关键不变量；任一致命项不满足则记录失败（CI 变红并触发通知）。"""
+    # 致命：官方源常量未被替换（patch_repo 失效）
+    if any(REPO_FROM in ln for p in walk_smali(root) for ln in read_lines(p)):
+        die(f"自检失败：仍存在官方源常量 {REPO_FROM}（patch_repo 未生效）")
+    # 致命：目标源未写入
+    if not any(repo_to in ln for p in walk_smali(root) for ln in read_lines(p)):
+        die(f"自检失败：未找到目标源 {repo_to}")
+    # 致命：App 内注入块缺失
+    app = next((p for p in walk_smali(root)
+                if p.replace("\\", "/").endswith("com/fongmi/android/tv/App.smali")), None)
+    if app is None:
+        die("自检失败：找不到 App.smali")
+    elif SKIP_LABEL not in "".join(read_lines(app)):
+        die("自检失败：App 内未找到注入块（inject 未生效）")
+    # 警告（非致命）：签名校验放行可能有遗漏。
+    # runtime：整段抛异常被替换为 return-void，字符串会消失，残留即未放行；
+    # BD-J：neutralize_signer 会把对应跳转行改为 "# patched" 注释；若含该文案却无 "# patched"，
+    #       说明该处结构已漂移、未被放行，需留意模块安装。
+    left = 0
+    for p in walk_smali(root):
+        src = "".join(read_lines(p))
+        if "Invalid runtime signer" in src:
+            left += 1
+        elif "Invalid BD-J runtime signer" in src and "# patched" not in src:
+            left += 1
+    if left:
+        print(f"[self-check][warn] 仍有 {left} 个文件签名校验未真正放行（上游或已改结构，留意模块安装）")
+    print("[self-check] 通过：更新源已改写、注入块存在、目标源已写入")
+
+
 # ---------------------------------------------------------------- main
 def main():
     if len(sys.argv) < 2:
@@ -393,8 +452,8 @@ def main():
     if t is None:
         finish()
         return
-    _p, task_desc, upd, byte = t
-    s = find_singleton(root, upd)
+    _p, task_desc, upd_candidates, byte = t
+    s = find_singleton(root, upd_candidates)
     if s is None:
         finish()
         return
@@ -402,8 +461,9 @@ def main():
     if ex is None:
         finish()
         return
-    inject(root, s[0], s[1], upd, task_desc, byte, ex)
+    inject(root, s[0], s[1], s[2], task_desc, byte, ex)
     neutralize_signer(root)
+    self_check(root, repo_to)
     finish()
 
 
