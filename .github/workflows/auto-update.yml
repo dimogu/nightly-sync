@@ -140,6 +140,7 @@ jobs:
 
       - name: keep-alive
         if: always()
+        continue-on-error: true
         run: |
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
           git config user.name "github-actions[bot]"
@@ -149,9 +150,14 @@ jobs:
           if [ "$PREV" != "$TODAY" ]; then
             echo "$TODAY" > .lastrun
             git add .lastrun
-            git commit -m "keepalive: $TODAY"
-            git push
-            echo "心跳已提交：$TODAY"
+            git commit -m "keepalive: $TODAY" || echo "commit 跳过（或已提交）"
+            for i in 1 2 3; do
+              git pull --rebase --autostash origin main 2>/dev/null || true
+              if git push; then
+                echo "心跳已提交：$TODAY"; break
+              fi
+              echo "心跳 push 失败，重试 $i..."
+            done
           else
             echo "今日已心跳，跳过"
           fi
