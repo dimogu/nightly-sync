@@ -1,21 +1,20 @@
 #!/usr/bin/env python3
 """
-repatch.py — 对反编译后的 smali 产物执行字符串替换与字节码注入。
+repatch.py — 对反编译后的产物执行地址常量改写与字节码插入。
 
-设计要点：目标产物的类名经过混淆、每次构建都会变化，因此本脚本
-不写死任何混淆名，全部在运行时按特征定位：
+目标产物的类名经混淆、每次构建都会变化，因此本脚本不写死任何混淆名，
+全部在运行时按特征定位：
 
-  1) 源地址：原始发布把仓库路径内联进了完整 URL 常量
+  1) 地址常量：原始发布把仓库路径内联进完整 URL 常量
      "https://api.github.com/repos/<owner/repo>/releases?per_page=100"
-     → 按 URL 段替换为目标地址，后续请求全部指向新地址。
-  2) 检查任务：含上述 URL 常量的 synthetic Runnable 类，
-     其 run() 里 packed-switch 按 byte 选择分支；含 URL 的分支即"联网检查"。
-     解析 packed-switch 数据段算出该分支的 byte 值。
-  3) 单例：从任务类的字段类型 X 出发，找静态字段 "...:LX;" 的 sget-object
-     调用点（App.onActivityResumed 里就有：单例 get()）。
-  4) 注入点：App.onActivityResumed 末尾（每个 Activity 回前台都会经过，App 类
-     在 AndroidManifest 引用下不会被混淆，四个 flavor 均保留原名）。
-     注入带节流的任务触发。
+     → 按 URL 段改写为目标地址，后续请求全部指向新地址。
+  2) 任务类：含上述 URL 常量的类，其 run() 内 packed-switch 按 byte 选择分支；
+     含该 URL 的分支即"联网检查"，解析 packed-switch 数据段算出该分支 byte 值。
+  3) 单例：从任务类的字段类型 X 出发，找静态字段 "...:LX;" 的读取点
+     （App 的回前台生命周期里就有该单例读取）。
+  4) 插入点：App 的回前台生命周期末尾（每个 Activity 回前台都会经过，
+     App 类在清单引用下不被混淆，四个 flavor 均保留原名）。
+     插入带节流的任务触发逻辑。
 
 用法：python3 repatch.py <apktool_反编译目录> [owner/repo]
 """
@@ -55,7 +54,7 @@ def write_lines(p, lines):
         f.writelines(lines)
 
 
-# ---------------------------------------------------------------- 1) 源地址
+# ---------------------------------------------------------------- 1) 地址常量
 def patch_repo(root, repo_to):
     n = 0
     for p in walk_smali(root):
@@ -77,7 +76,7 @@ def patch_repo(root, repo_to):
         if already:
             print(f'[repo] 已指向 "{repo_to}"（幂等跳过）')
         else:
-            die("未找到匹配的源地址常量")
+            die("未找到匹配的地址常量")
         return n
     print(f'[repo] 已把 {n} 个文件指向 "{repo_to}"')
     return n
@@ -86,16 +85,20 @@ def patch_repo(root, repo_to):
 # ------------------------------------------------------- 2) 任务类发现
 def find_task_class(root):
     """返回 (task_path, task_desc, updater_desc, check_byte)"""
-    hits = []
-    for p in walk_smali(root):
-        text = "".join(read_lines(p))
-        if TASK_URL_MARK in text:
-            hits.append(p)
+    hits = [p for p in walk_smali(root) if TASK_URL_MARK in "".join(read_lines(p))]
     if not hits:
         die(f'未找到含 "{TASK_URL_MARK}" 的任务类')
         return None
     if len(hits) > 1:
-        print(f"[warn] 命中 {len(hits)} 处，取首个: {hits}")
+        # 多命中时优先 catvod / fongmi 包（更可能是真正的检查任务）
+        pref = [
+            h
+            for h in hits
+            if "/catvod/" in h.replace("\\", "/") or "/fongmi/" in h.replace("\\", "/")
+        ]
+        if pref:
+            hits = pref
+        print(f"[warn] 命中 {len(hits)} 处，取: {hits[0]}")
 
     p = hits[0]
     desc = smali_class_desc(p)
@@ -197,7 +200,7 @@ def find_singleton(root, upd):
 
 
 def find_executor(root):
-    """优先 Task.execute（后台线程），退回 App.a（主线程）。"""
+    """优先后台线程执行器，退回主线程执行器。"""
     want = "Lcom/github/catvod/utils/Task;->execute(Ljava/lang/Runnable;)V"
     for p in walk_smali(root):
         if any(want in ln for ln in read_lines(p)):
@@ -205,13 +208,25 @@ def find_executor(root):
     alt = "Lcom/fongmi/android/tv/App;->a(Ljava/lang/Runnable;)V"
     for p in walk_smali(root):
         if any(alt in ln for ln in read_lines(p)):
-            print("[exec] 退回 App.a（主线程）")
+            print("[exec] 退回主线程执行器")
             return alt
-    die("既没有 Task.execute 也没有 App.a(Runnable)")
+    die("未找到可用的执行器")
     return None
 
 
-# ------------------------------------------------------------- 4) 注入
+def method_ranges(lines):
+    ranges = []
+    s = None
+    for i, ln in enumerate(lines):
+        if ln.startswith(".method"):
+            s = i
+        elif ln.startswith(".end method") and s is not None:
+            ranges.append((s, i))
+            s = None
+    return ranges
+
+
+# ------------------------------------------------------------- 4) 插入
 def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
     app = None
     for p in walk_smali(root):
@@ -235,37 +250,60 @@ def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
             e = i
             break
     if s is None:
-        die("App.smali 里没有 onActivityResumed")
+        # 兜底锚点：尝试 onResume
+        for i, ln in enumerate(lines):
+            if re.match(r"^\.method.*\bonResume\b", ln):
+                s = i
+            elif s is not None and ".end method" in ln:
+                e = i
+                break
+    if s is None:
+        die("App.smali 里找不到合适的生命周期方法")
         return
 
+    # 读取方法内 .locals 声明；动态分配寄存器：在原 locals 之上再加 8 个，
+    # 保证完全不覆盖方法原有任何寄存器（包括参数寄存器）。
+    cur_locals = 0
     for i in range(s, e):
-        m = re.match(r"^(\s*)\.locals\s+(\d+)", lines[i])
+        m = re.match(r"^\s*\.locals\s+(\d+)", lines[i])
         if m:
-            if int(m.group(2)) < 8:
-                lines[i] = f"{m.group(1)}.locals 8\n"
+            cur_locals = int(m.group(1))
             break
+    new_locals = cur_locals + 8
+    R = cur_locals  # 第一个新增寄存器
+    for i in range(s, e):
+        if re.match(r"^\s*\.locals\s+\d+", lines[i]):
+            lines[i] = f"    .locals {new_locals}\n"
+            break
+    else:
+        # 方法没有 .locals 声明，在方法签名后插入
+        lines.insert(s + 1, f"    .locals {new_locals}\n")
 
     rets = [i for i in range(s, e) if re.match(r"^\s*return-void\s*$", lines[i])]
     if not rets:
-        die("onActivityResumed 里找不到 return-void")
+        die("目标方法里找不到 return-void")
         return
     ret = rets[-1]
+
+    def v(idx):
+        return f"v{idx}"
+
     block = [
-        "    invoke-static {}, Ljava/lang/System;->currentTimeMillis()J\n",
-        "    move-result-wide v0\n",
-        "    sget-wide v2, Lcom/fongmi/android/tv/App;->awu:J\n",
-        "    sub-long/2addr v0, v2\n",
-        f"    const-wide/32 v2, 0x{INTERVAL_MS:x}\n",
-        "    cmp-long v4, v0, v2\n",
-        f"    if-ltz v4, {SKIP_LABEL}\n",
-        "    invoke-static {}, Ljava/lang/System;->currentTimeMillis()J\n",
-        "    move-result-wide v0\n",
-        "    sput-wide v0, Lcom/fongmi/android/tv/App;->awu:J\n",
-        f"    sget-object v5, {single_cls}->{single_fld}:{upd}\n",
-        f"    new-instance v6, {task_desc}\n",
-        f"    const/4 v7, 0x{byte:x}\n",
-        f"    invoke-direct {{v6, v5, v7}}, {task_desc}-><init>({upd}B)V\n",
-        f"    invoke-static {{v6}}, {executor}\n",
+        f"    invoke-static {{}}, Ljava/lang/System;->currentTimeMillis()J\n",
+        f"    move-result-wide {v(R)}\n",
+        f"    sget-wide {v(R + 2)}, Lcom/fongmi/android/tv/App;->awu:J\n",
+        f"    sub-long/2addr {v(R)}, {v(R + 2)}\n",
+        f"    const-wide/32 {v(R + 2)}, 0x{INTERVAL_MS:x}\n",
+        f"    cmp-long {v(R + 4)}, {v(R)}, {v(R + 2)}\n",
+        f"    if-ltz {v(R + 4)}, {SKIP_LABEL}\n",
+        f"    invoke-static {{}}, Ljava/lang/System;->currentTimeMillis()J\n",
+        f"    move-result-wide {v(R)}\n",
+        f"    sput-wide {v(R)}, Lcom/fongmi/android/tv/App;->awu:J\n",
+        f"    sget-object {v(R + 5)}, {single_cls}->{single_fld}:{upd}\n",
+        f"    new-instance {v(R + 6)}, {task_desc}\n",
+        f"    const/4 {v(R + 7)}, 0x{byte:x}\n",
+        f"    invoke-direct {{{v(R + 6)}, {v(R + 5)}, {v(R + 7)}}}, {task_desc}-><init>({upd}B)V\n",
+        f"    invoke-static {{{v(R + 6)}}}, {executor}\n",
         f"    {SKIP_LABEL}\n",
     ]
     lines[ret:ret] = block
@@ -274,70 +312,72 @@ def inject(root, single_cls, single_fld, upd, task_desc, byte, executor):
     lines.insert(first_method, MARKER_FIELD + "\n")
 
     write_lines(app, lines)
-    print(f"[inject] 完成（byte={byte}）")
+    print(f"[inject] 完成（byte={byte}, 新增寄存器 v{R}..v{R + 7}）")
 
 
-# ------------------------------------------------ 5) 放行运行时签名校验
-def patch_runtime_signer(root):
-    """官方把 runtime 模块（MPV/Python/Node.js/QuickJS/Thunder 等）设计为
-    必须用与宿主一致的签名；重签名后模块仍是官方签名，verifyPackage 必失败。
-    模块是独立安装包（系统安装已成功），此处仅放行 App 层的签名校验。"""
-    # 5a) 共享校验：com/github/catvod/utils/RuntimeModule.verifyPackage
-    rt = None
+# ------------------------------------------ 5) 放行宿主签名校验（全包扫描）
+def neutralize_signer(root):
+    """扫描全包，放行所有宿主签名校验（runtime 模块、BD-J 等）。
+    重签名后模块仍是原始签名，此处仅放行 App 层校验。"""
+    total = 0
     for p in walk_smali(root):
-        if p.replace("\\", "/").endswith("com/github/catvod/utils/RuntimeModule.smali"):
-            rt = p
-            break
-    if rt is None:
-        die("未找到 RuntimeModule.smali")
-        return
-    lines = read_lines(rt)
-    if "Invalid runtime signer" in "".join(lines):
-        idx = next(i for i, ln in enumerate(lines) if "Invalid runtime signer" in ln)
-        j = idx
-        while j < len(lines) and "throw p0" not in lines[j]:
-            j += 1
-        k = idx
-        while k >= 0 and not lines[k].strip().startswith(":cond_1"):
-            k -= 1
-        if k >= 0 and j < len(lines):
-            lines[k : j + 1] = ["    :cond_1\n", "    return-void\n"]
-            write_lines(rt, lines)
-            print("[runtime] 共享 verifyPackage 签名校验已放行")
-        else:
-            die("RuntimeModule 签名校验块定位失败")
+        lines = read_lines(p)
+        if "Invalid runtime signer" not in "".join(lines) and "Invalid BD-J runtime signer" not in "".join(lines):
+            continue
+        changed = False
+        for (ms, me) in method_ranges(lines):
+            seg = lines[ms : me + 1]
+            seg, c1 = _patch_method_runtime(seg)
+            seg, c2 = _patch_method_bdj(seg)
+            if c1 or c2:
+                lines[ms : me + 1] = seg
+                changed = True
+        if changed:
+            write_lines(p, lines)
+            total += 1
+    if total:
+        print(f"[signer] 已放行 {total} 个类的签名校验")
     else:
-        print("[runtime] 共享校验已处理（幂等跳过）")
+        print("[signer] 未发现待放行签名校验（幂等跳过）")
 
-    # 5b) BD-J 专属校验（混淆名不定，按内容定位）
-    bdj = None
-    for p in walk_smali(root):
-        if any("Invalid BD-J runtime signer" in ln for ln in read_lines(p)):
-            bdj = p
-            break
-    if bdj is None:
-        print("[runtime] 未找到 BD-J 校验，跳过")
-        return
-    lines = read_lines(bdj)
-    ci = None
-    for i, ln in enumerate(lines):
-        if "containsAll(Ljava/util/Collection;)Z" in ln:
-            ci = i
-            break
+
+def _patch_method_runtime(seg):
+    changed = False
+    i = 0
+    n = len(seg)
+    while i < n:
+        if "Invalid runtime signer" in seg[i]:
+            j = i + 1
+            while j < n and "throw" not in seg[j] and ".end method" not in seg[j]:
+                j += 1
+            if j < n and "throw" in seg[j]:
+                k = i
+                while k >= 0 and not seg[k].strip().startswith(":cond"):
+                    k -= 1
+                if k >= 0:
+                    seg[k : j + 1] = [seg[k], "    return-void\n"]
+                    n = len(seg)
+                    i = k + 1
+                    changed = True
+                    continue
+        i += 1
+    return seg, changed
+
+
+def _patch_method_bdj(seg):
+    changed = False
+    ci = next(
+        (idx for idx, l in enumerate(seg) if "containsAll(Ljava/util/Collection;)Z" in l),
+        None,
+    )
     if ci is None:
-        print("[runtime] BD-J 未找到 containsAll，跳过")
-        return
-    ti = None
-    for i in range(ci, min(ci + 15, len(lines))):
-        if re.match(r"^\s*if-eqz v5, :cond_c\s*$", lines[i]):
-            ti = i
+        return seg, changed
+    for i2 in range(ci, min(ci + 12, len(seg))):
+        if re.match(r"^\s*if-eqz v5, :cond_c\s*$", seg[i2]):
+            seg[i2] = "    # patched: 跳过运行时签名校验\n"
+            changed = True
             break
-    if ti is None:
-        print("[runtime] BD-J 签名校验已处理（幂等跳过）")
-        return
-    lines[ti] = "    # patched: 跳过 BD-J 运行时签名校验\n"
-    write_lines(bdj, lines)
-    print("[runtime] BD-J 签名校验已放行")
+    return seg, changed
 
 
 # ---------------------------------------------------------------- main
@@ -363,7 +403,7 @@ def main():
         finish()
         return
     inject(root, s[0], s[1], upd, task_desc, byte, ex)
-    patch_runtime_signer(root)
+    neutralize_signer(root)
     finish()
 
 
